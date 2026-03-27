@@ -3,12 +3,14 @@ import { z } from "zod";
 import { runAppleScript, escapeForAppleScript } from "../applescript.js";
 import { success, error, withErrorHandling } from "../helpers.js";
 
-function appleScriptDate(iso: string): string {
-  const d = new Date(iso);
-  return d.toLocaleDateString("en-US", {
-    weekday: "long", year: "numeric", month: "long", day: "numeric",
-    hour: "numeric", minute: "numeric", second: "numeric",
-  });
+// Generates AppleScript that sets a date variable by components (locale-independent)
+function asDateVar(varName: string, iso: string, timeOfDay = 0): string {
+  const d = new Date(iso.includes("T") ? iso : iso + "T00:00:00");
+  return `set ${varName} to current date
+  set year of ${varName} to ${d.getFullYear()}
+  set month of ${varName} to ${d.getMonth() + 1}
+  set day of ${varName} to ${d.getDate()}
+  set time of ${varName} to ${timeOfDay}`;
 }
 
 interface CalEvent {
@@ -51,16 +53,12 @@ export function registerEventTools(server: McpServer) {
       calendar: z.string().optional().describe("Calendar name filter (omit for all)"),
     },
     withErrorHandling(async ({ date_from, date_to, calendar }) => {
-      const from = appleScriptDate(date_from);
-      const to = appleScriptDate(date_to || date_from);
       const calFilter = calendar ? `whose name is "${escapeForAppleScript(calendar)}"` : "";
 
       const script = `
 tell application "Calendar"
-  set rangeStart to date "${from}"
-  set time of rangeStart to 0
-  set rangeEnd to date "${to}"
-  set time of rangeEnd to 86399
+  ${asDateVar("rangeStart", date_from, 0)}
+  ${asDateVar("rangeEnd", date_to || date_from, 86399)}
   set output to ""
   repeat with cal in (every calendar${calFilter ? " " + calFilter : ""})
     try
@@ -130,22 +128,15 @@ end tell`;
       calendar: z.string().optional().describe("Calendar name filter"),
     },
     withErrorHandling(async ({ query, date_from, date_to, calendar }) => {
-      const fromStr = date_from
-        ? appleScriptDate(date_from)
-        : appleScriptDate(new Date().toISOString().slice(0, 10));
-      const toDate = date_to
-        ? new Date(date_to)
-        : new Date(Date.now() + 30 * 86400000);
-      const toStr = appleScriptDate(toDate.toISOString().slice(0, 10));
+      const fromIso = date_from || new Date().toISOString().slice(0, 10);
+      const toIso = date_to || new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
       const esc = escapeForAppleScript;
       const calFilter = calendar ? ` whose name is "${esc(calendar)}"` : "";
 
       const script = `
 tell application "Calendar"
-  set rangeStart to date "${fromStr}"
-  set time of rangeStart to 0
-  set rangeEnd to date "${toStr}"
-  set time of rangeEnd to 86399
+  ${asDateVar("rangeStart", fromIso, 0)}
+  ${asDateVar("rangeEnd", toIso, 86399)}
   set output to ""
   repeat with cal in (every calendar${calFilter})
     try
@@ -181,16 +172,15 @@ end tell`;
     },
     withErrorHandling(async ({ title, calendar, start, end, location, description, allday }) => {
       const esc = escapeForAppleScript;
-      const startStr = appleScriptDate(start);
-      const endStr = appleScriptDate(end);
-
       const locationLine = location ? `\n  set location of newEvent to "${esc(location)}"` : "";
       const descLine = description ? `\n  set description of newEvent to "${esc(description)}"` : "";
 
       const script = `
 tell application "Calendar"
+  ${asDateVar("evtStart", start)}
+  ${asDateVar("evtEnd", end)}
   set cal to first calendar whose name is "${esc(calendar)}"
-  set newEvent to make new event at end of events of cal with properties {summary: "${esc(title)}", start date: date "${startStr}", end date: date "${endStr}", allday event: ${allday}}${locationLine}${descLine}
+  set newEvent to make new event at end of events of cal with properties {summary: "${esc(title)}", start date: evtStart, end date: evtEnd, allday event: ${allday}}${locationLine}${descLine}
   return uid of newEvent
 end tell`;
 
@@ -213,9 +203,10 @@ end tell`;
     withErrorHandling(async ({ uid, title, start, end, location, description }) => {
       const esc = escapeForAppleScript;
       const updates: string[] = [];
+      const dateSetup: string[] = [];
       if (title) updates.push(`set summary of e to "${esc(title)}"`);
-      if (start) updates.push(`set start date of e to date "${appleScriptDate(start)}"`);
-      if (end) updates.push(`set end date of e to date "${appleScriptDate(end)}"`);
+      if (start) { dateSetup.push(asDateVar("newStart", start)); updates.push(`set start date of e to newStart`); }
+      if (end) { dateSetup.push(asDateVar("newEnd", end)); updates.push(`set end date of e to newEnd`); }
       if (location !== undefined) updates.push(`set location of e to "${esc(location)}"`);
       if (description !== undefined) updates.push(`set description of e to "${esc(description)}"`);
 
@@ -223,6 +214,7 @@ end tell`;
 
       const script = `
 tell application "Calendar"
+  ${dateSetup.join("\n  ")}
   set foundEvent to missing value
   repeat with cal in every calendar
     try
