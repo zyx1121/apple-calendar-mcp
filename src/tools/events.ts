@@ -1,0 +1,270 @@
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { runAppleScript, escapeForAppleScript } from "../applescript.js";
+import { success, error, withErrorHandling } from "../helpers.js";
+
+function appleScriptDate(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString("en-US", {
+    weekday: "long", year: "numeric", month: "long", day: "numeric",
+    hour: "numeric", minute: "numeric", second: "numeric",
+  });
+}
+
+interface CalEvent {
+  uid: string;
+  title: string;
+  calendar: string;
+  start: string;
+  end: string;
+  allday: boolean;
+  location: string;
+}
+
+function parseEvents(raw: string): CalEvent[] {
+  if (!raw) return [];
+  const events: CalEvent[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    const parts = line.split("\t");
+    if (parts.length < 6) continue;
+    events.push({
+      uid: parts[0],
+      title: parts[1],
+      calendar: parts[2],
+      start: parts[3],
+      end: parts[4],
+      allday: parts[5] === "true",
+      location: parts[6] || "",
+    });
+  }
+  return events;
+}
+
+export function registerEventTools(server: McpServer) {
+  server.tool(
+    "calendar_list_events",
+    "List calendar events within a date range",
+    {
+      date_from: z.string().describe("ISO 8601 date, e.g. '2026-03-27'"),
+      date_to: z.string().optional().describe("ISO 8601 date (default: same as date_from)"),
+      calendar: z.string().optional().describe("Calendar name filter (omit for all)"),
+    },
+    withErrorHandling(async ({ date_from, date_to, calendar }) => {
+      const from = appleScriptDate(date_from);
+      const to = appleScriptDate(date_to || date_from);
+      const calFilter = calendar ? `whose name is "${escapeForAppleScript(calendar)}"` : "";
+
+      const script = `
+tell application "Calendar"
+  set rangeStart to date "${from}"
+  set time of rangeStart to 0
+  set rangeEnd to date "${to}"
+  set time of rangeEnd to 86399
+  set output to ""
+  repeat with cal in (every calendar${calFilter ? " " + calFilter : ""})
+    try
+      set evts to (every event of cal whose start date >= rangeStart and start date <= rangeEnd)
+      repeat with e in evts
+        set loc to ""
+        try
+          if location of e is not missing value then set loc to location of e
+        end try
+        set output to output & (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\n"
+      end repeat
+    end try
+  end repeat
+  return output
+end tell`;
+
+      const raw = await runAppleScript(script);
+      return success(parseEvents(raw));
+    }),
+  );
+
+  server.tool(
+    "calendar_get_event",
+    "Get full details of a calendar event by UID",
+    {
+      uid: z.string().describe("Event UID"),
+    },
+    withErrorHandling(async ({ uid }) => {
+      const esc = escapeForAppleScript;
+      const script = `
+tell application "Calendar"
+  repeat with cal in every calendar
+    try
+      set e to first event of cal whose uid is "${esc(uid)}"
+      set loc to ""
+      try
+        if location of e is not missing value then set loc to location of e
+      end try
+      set desc to ""
+      try
+        if description of e is not missing value then set desc to description of e
+      end try
+      return (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\t" & desc
+    end try
+  end repeat
+  return ""
+end tell`;
+
+      const raw = await runAppleScript(script);
+      if (!raw) return error(`Event ${uid} not found.`);
+      const p = raw.split("\t");
+      return success({
+        uid: p[0], title: p[1], calendar: p[2],
+        start: p[3], end: p[4], allday: p[5] === "true",
+        location: p[6] || "", description: p[7] || "",
+      });
+    }),
+  );
+
+  server.tool(
+    "calendar_search_events",
+    "Search events by keyword within a date range",
+    {
+      query: z.string().min(1).describe("Search keyword"),
+      date_from: z.string().optional().describe("ISO 8601 start date (default: today)"),
+      date_to: z.string().optional().describe("ISO 8601 end date (default: 30 days from date_from)"),
+      calendar: z.string().optional().describe("Calendar name filter"),
+    },
+    withErrorHandling(async ({ query, date_from, date_to, calendar }) => {
+      const fromStr = date_from
+        ? appleScriptDate(date_from)
+        : appleScriptDate(new Date().toISOString().slice(0, 10));
+      const toDate = date_to
+        ? new Date(date_to)
+        : new Date(Date.now() + 30 * 86400000);
+      const toStr = appleScriptDate(toDate.toISOString().slice(0, 10));
+      const esc = escapeForAppleScript;
+      const calFilter = calendar ? ` whose name is "${esc(calendar)}"` : "";
+
+      const script = `
+tell application "Calendar"
+  set rangeStart to date "${fromStr}"
+  set time of rangeStart to 0
+  set rangeEnd to date "${toStr}"
+  set time of rangeEnd to 86399
+  set output to ""
+  repeat with cal in (every calendar${calFilter})
+    try
+      set evts to (every event of cal whose start date >= rangeStart and start date <= rangeEnd and summary contains "${esc(query)}")
+      repeat with e in evts
+        set loc to ""
+        try
+          if location of e is not missing value then set loc to location of e
+        end try
+        set output to output & (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\n"
+      end repeat
+    end try
+  end repeat
+  return output
+end tell`;
+
+      const raw = await runAppleScript(script);
+      return success(parseEvents(raw));
+    }),
+  );
+
+  server.tool(
+    "calendar_create_event",
+    "Create a new calendar event",
+    {
+      title: z.string().describe("Event title"),
+      calendar: z.string().describe("Calendar name to add event to"),
+      start: z.string().describe("ISO 8601 datetime, e.g. '2026-03-28T10:00:00'"),
+      end: z.string().describe("ISO 8601 datetime, e.g. '2026-03-28T11:00:00'"),
+      location: z.string().optional().describe("Event location"),
+      description: z.string().optional().describe("Event notes/description"),
+      allday: z.coerce.boolean().default(false).describe("All-day event"),
+    },
+    withErrorHandling(async ({ title, calendar, start, end, location, description, allday }) => {
+      const esc = escapeForAppleScript;
+      const startStr = appleScriptDate(start);
+      const endStr = appleScriptDate(end);
+
+      const locationLine = location ? `\n  set location of newEvent to "${esc(location)}"` : "";
+      const descLine = description ? `\n  set description of newEvent to "${esc(description)}"` : "";
+
+      const script = `
+tell application "Calendar"
+  set cal to first calendar whose name is "${esc(calendar)}"
+  set newEvent to make new event at end of events of cal with properties {summary: "${esc(title)}", start date: date "${startStr}", end date: date "${endStr}", allday event: ${allday}}${locationLine}${descLine}
+  return uid of newEvent
+end tell`;
+
+      const uid = await runAppleScript(script);
+      return success({ uid, title, calendar, start, end, created: true });
+    }),
+  );
+
+  server.tool(
+    "calendar_update_event",
+    "Update an existing calendar event",
+    {
+      uid: z.string().describe("Event UID"),
+      title: z.string().optional().describe("New title"),
+      start: z.string().optional().describe("New start datetime (ISO 8601)"),
+      end: z.string().optional().describe("New end datetime (ISO 8601)"),
+      location: z.string().optional().describe("New location"),
+      description: z.string().optional().describe("New description"),
+    },
+    withErrorHandling(async ({ uid, title, start, end, location, description }) => {
+      const esc = escapeForAppleScript;
+      const updates: string[] = [];
+      if (title) updates.push(`set summary of e to "${esc(title)}"`);
+      if (start) updates.push(`set start date of e to date "${appleScriptDate(start)}"`);
+      if (end) updates.push(`set end date of e to date "${appleScriptDate(end)}"`);
+      if (location !== undefined) updates.push(`set location of e to "${esc(location)}"`);
+      if (description !== undefined) updates.push(`set description of e to "${esc(description)}"`);
+
+      if (updates.length === 0) return error("No fields to update.");
+
+      const script = `
+tell application "Calendar"
+  set foundEvent to missing value
+  repeat with cal in every calendar
+    try
+      set e to first event of cal whose uid is "${esc(uid)}"
+      ${updates.join("\n      ")}
+      set foundEvent to e
+      exit repeat
+    end try
+  end repeat
+  if foundEvent is missing value then return "not found"
+  return "updated"
+end tell`;
+
+      const result = await runAppleScript(script);
+      if (result !== "updated") return error(`Event ${uid} not found.`);
+      return success({ uid, updated: true });
+    }),
+  );
+
+  server.tool(
+    "calendar_delete_event",
+    "Delete a calendar event",
+    {
+      uid: z.string().describe("Event UID"),
+    },
+    withErrorHandling(async ({ uid }) => {
+      const esc = escapeForAppleScript;
+      const script = `
+tell application "Calendar"
+  repeat with cal in every calendar
+    try
+      set e to first event of cal whose uid is "${esc(uid)}"
+      delete e
+      return "ok"
+    end try
+  end repeat
+  return "not found"
+end tell`;
+
+      const result = await runAppleScript(script);
+      if (result === "not found") return error(`Event ${uid} not found.`);
+      return success({ uid, deleted: true });
+    }),
+  );
+}
