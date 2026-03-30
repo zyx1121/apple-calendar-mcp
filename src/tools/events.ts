@@ -21,6 +21,7 @@ interface CalEvent {
   end: string;
   allday: boolean;
   location: string;
+  recurrence: string;
 }
 
 function parseEvents(raw: string): CalEvent[] {
@@ -38,6 +39,7 @@ function parseEvents(raw: string): CalEvent[] {
       end: parts[4],
       allday: parts[5] === "true",
       location: parts[6] || "",
+      recurrence: parts[7] || "",
     });
   }
   return events;
@@ -68,7 +70,11 @@ tell application "Calendar"
         try
           if location of e is not missing value then set loc to location of e
         end try
-        set output to output & (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\n"
+        set rec to ""
+        try
+          if recurrence of e is not missing value then set rec to recurrence of e
+        end try
+        set output to output & (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\t" & rec & "\\n"
       end repeat
     end try
   end repeat
@@ -101,7 +107,30 @@ tell application "Calendar"
       try
         if description of e is not missing value then set desc to description of e
       end try
-      return (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\t" & desc
+      set rec to ""
+      try
+        if recurrence of e is not missing value then set rec to recurrence of e
+      end try
+      set attendeeInfo to ""
+      try
+        set attendeeList to every attendee of e
+        repeat with a in attendeeList
+          set aName to ""
+          try
+            set aName to display name of a
+          end try
+          set aEmail to ""
+          try
+            set aEmail to address of a
+          end try
+          set aStatus to "unknown"
+          try
+            set aStatus to participation status of a as string
+          end try
+          set attendeeInfo to attendeeInfo & aName & "|||" & aEmail & "|||" & aStatus & ";;;"
+        end repeat
+      end try
+      return (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\t" & desc & "\\t" & rec & "\\t" & attendeeInfo
     end try
   end repeat
   return ""
@@ -110,10 +139,15 @@ end tell`;
       const raw = await runAppleScript(script);
       if (!raw) return error(`Event ${uid} not found.`);
       const p = raw.split("\t");
+      const attendees = (p[9] || "").split(";;;").filter(Boolean).map((a) => {
+        const [name, email, status] = a.split("|||");
+        return { name: name || "", email: email || "", status: status || "unknown" };
+      });
       return success({
         uid: p[0], title: p[1], calendar: p[2],
         start: p[3], end: p[4], allday: p[5] === "true",
         location: p[6] || "", description: p[7] || "",
+        recurrence: p[8] || "", attendees,
       });
     }),
   );
@@ -146,7 +180,11 @@ tell application "Calendar"
         try
           if location of e is not missing value then set loc to location of e
         end try
-        set output to output & (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\n"
+        set rec to ""
+        try
+          if recurrence of e is not missing value then set rec to recurrence of e
+        end try
+        set output to output & (uid of e) & "\\t" & (summary of e) & "\\t" & (name of cal) & "\\t" & (start date of e as string) & "\\t" & (end date of e as string) & "\\t" & (allday event of e) & "\\t" & loc & "\\t" & rec & "\\n"
       end repeat
     end try
   end repeat
@@ -169,18 +207,20 @@ end tell`;
       location: z.string().optional().describe("Event location"),
       description: z.string().optional().describe("Event notes/description"),
       allday: z.coerce.boolean().default(false).describe("All-day event"),
+      recurrence: z.string().optional().describe("iCalendar RRULE string, e.g. 'FREQ=WEEKLY;INTERVAL=1', 'FREQ=WEEKLY;BYDAY=MO,WE,FR', 'FREQ=DAILY;COUNT=10'"),
     },
-    withErrorHandling(async ({ title, calendar, start, end, location, description, allday }) => {
+    withErrorHandling(async ({ title, calendar, start, end, location, description, allday, recurrence }) => {
       const esc = escapeForAppleScript;
       const locationLine = location ? `\n  set location of newEvent to "${esc(location)}"` : "";
       const descLine = description ? `\n  set description of newEvent to "${esc(description)}"` : "";
+      const recLine = recurrence ? `\n  set recurrence of newEvent to "${esc(recurrence)}"` : "";
 
       const script = `
 tell application "Calendar"
   ${asDateVar("evtStart", start)}
   ${asDateVar("evtEnd", end)}
   set cal to first calendar whose name is "${esc(calendar)}"
-  set newEvent to make new event at end of events of cal with properties {summary: "${esc(title)}", start date: evtStart, end date: evtEnd, allday event: ${allday}}${locationLine}${descLine}
+  set newEvent to make new event at end of events of cal with properties {summary: "${esc(title)}", start date: evtStart, end date: evtEnd, allday event: ${allday}}${locationLine}${descLine}${recLine}
   return uid of newEvent
 end tell`;
 
@@ -199,8 +239,9 @@ end tell`;
       end: z.string().optional().describe("New end datetime (ISO 8601)"),
       location: z.string().optional().describe("New location"),
       description: z.string().optional().describe("New description"),
+      recurrence: z.string().optional().describe("iCalendar RRULE string, e.g. 'FREQ=WEEKLY;INTERVAL=1', 'FREQ=WEEKLY;BYDAY=MO,WE,FR', 'FREQ=DAILY;COUNT=10'"),
     },
-    withErrorHandling(async ({ uid, title, start, end, location, description }) => {
+    withErrorHandling(async ({ uid, title, start, end, location, description, recurrence }) => {
       const esc = escapeForAppleScript;
       const updates: string[] = [];
       const dateSetup: string[] = [];
@@ -209,6 +250,7 @@ end tell`;
       if (end) { dateSetup.push(asDateVar("newEnd", end)); updates.push(`set end date of e to newEnd`); }
       if (location !== undefined) updates.push(`set location of e to "${esc(location)}"`);
       if (description !== undefined) updates.push(`set description of e to "${esc(description)}"`);
+      if (recurrence !== undefined) updates.push(`set recurrence of e to "${esc(recurrence)}"`);
 
       if (updates.length === 0) return error("No fields to update.");
 
